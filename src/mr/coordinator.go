@@ -21,6 +21,8 @@ type Coordinator struct {
 
 	runningTaskWorkerTimerMap map[string]*time.Timer
 
+	reduceIndex int
+
 	mutex sync.Mutex
 }
 
@@ -32,48 +34,84 @@ type runningTask struct {
 	workerId string
 }
 
-// start a thread that listens for RPCs from worker.go
+// start a thread that listens for RPCs from mrWorker.go
 func (c *Coordinator) server() {
-	rpc.Register(c)
+	err := rpc.Register(c)
+	if err != nil {
+		log.Fatal("register error:", err)
+	}
+
 	rpc.HandleHTTP()
 	l, e := net.Listen("tcp", ":1234")
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
-	go http.Serve(l, nil)
+	go func() {
+		err := http.Serve(l, nil)
+		if err != nil {
+			log.Fatal("Serve error:", err)
+		}
+	}()
 }
 
 // Done main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	return c.taskQueue.Len() == 0 && len(c.runningTaskWorkerMap) == 0
-}
-
-func (c *Coordinator) taskDone(taskDone TaskDone) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	delete(c.runningTaskWorkerMap, taskDone.WorkerId)
-
-	timer := c.runningTaskWorkerTimerMap[taskDone.WorkerId]
-	timer.Stop()
-	delete(c.runningTaskWorkerTimerMap, taskDone.WorkerId)
+	return c.taskQueue.Len() == 0 && len(c.runningTaskWorkerMap) == 0
 }
 
-func (c *Coordinator) PollTask(requestTask RequestTask) *Task {
+func (c *Coordinator) ReceiveMapTaskDone(taskDone *MapTaskDone) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.runningTaskWorkerMap[taskDone.WorkerId] != nil {
+		log.Println("The task has been done.")
+		return
+	}
+
+	c.clearTask(taskDone.WorkerId)
+	c.addReduceTaskFromMapTask(*taskDone)
+}
+
+func (c *Coordinator) ReceiveReduceTaskDone(taskDone *ReduceTaskDone) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.runningTaskWorkerMap[taskDone.WorkerId] != nil {
+		log.Println("The task has been done.")
+		return
+	}
+
+	c.clearTask(taskDone.WorkerId)
+}
+
+func (c *Coordinator) clearTask(workerId string) {
+	delete(c.runningTaskWorkerMap, workerId)
+
+	timer := c.runningTaskWorkerTimerMap[workerId]
+	timer.Stop()
+	delete(c.runningTaskWorkerTimerMap, workerId)
+}
+
+func (c *Coordinator) PollTask(requestTask *RequestTask, task *Task) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	if c.taskQueue.Len() == 0 {
-		return &Task{TaskType: NoTask}
+		task.TaskType = CurrentNoTask
+		return nil
 	}
 
-	task := c.popFrontTask()
+	newTask := c.popFrontTask()
+	task.SetFrom(newTask)
 
-	c.addRunningTask(requestTask, task)
-	c.registerCheckTimer(requestTask)
+	c.addRunningTask(*requestTask, newTask)
+	c.registerCheckTimer(*requestTask)
 
-	return task
+	return nil
 }
 
 func (c *Coordinator) registerCheckTimer(requestTask RequestTask) {
@@ -91,6 +129,19 @@ func (c *Coordinator) registerCheckTimer(requestTask RequestTask) {
 	c.runningTaskWorkerTimerMap[requestTask.WorkerId] = timer
 }
 
+func (c *Coordinator) addReduceTaskFromMapTask(mapTaskDone MapTaskDone) {
+	for i := 0; i < len(mapTaskDone.mapOutFiles); i++ {
+		reduceTask := Task{
+			FileName:        mapTaskDone.mapOutFiles[i],
+			NReduce:         c.nReduce,
+			ReduceFileIndex: c.reduceIndex,
+			TaskType:        ReduceTask,
+		}
+		c.taskQueue.PushBack(&reduceTask)
+		c.reduceIndex++
+	}
+}
+
 func (c *Coordinator) addRunningTask(requestTask RequestTask, task *Task) {
 	c.runningTaskWorkerMap[requestTask.WorkerId] = &runningTask{
 		task:      task,
@@ -106,10 +157,12 @@ func (c *Coordinator) popFrontTask() *Task {
 }
 
 func (c *Coordinator) initMapTask(originalFileNames []string) {
-	for _, originalFileName := range originalFileNames {
+	for index, originalFileName := range originalFileNames {
 		c.taskQueue.PushBack(&Task{
-			TaskType: MapTask,
-			FileName: originalFileName,
+			TaskType:     MapTask,
+			MapFileIndex: index,
+			FileName:     originalFileName,
+			NReduce:      c.nReduce,
 		})
 	}
 }
@@ -124,6 +177,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		taskQueue:                 list.New(),
 		runningTaskWorkerMap:      make(map[string]*runningTask),
 		runningTaskWorkerTimerMap: make(map[string]*time.Timer),
+		reduceIndex:               0,
 		mutex:                     sync.Mutex{},
 	}
 	c.initMapTask(files)
