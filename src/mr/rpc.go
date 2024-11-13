@@ -1,29 +1,64 @@
 package mr
 
+import (
+	"os"
+	"strconv"
+)
+
 //
 // RPC definitions.
 //
-// remember to capitalize all names.
-//
 
-import "os"
-import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
+type RequestTask struct {
 }
 
-type ExampleReply struct {
-	Y int
+type MapTaskDone struct {
+	TaskId int
+
+	MapOutFiles []string
 }
 
-// Add your RPC definitions here.
+type ReduceTaskDone struct {
+	TaskId int
+}
 
+type Task struct {
+	NReduce int
+
+	TaskType TaskType
+
+	TaskId int
+
+	InputMapFileIndex int
+
+	InputMapFileName string
+
+	InputReduceFileIndex int
+
+	InputReduceFileNames []string
+}
+
+type Response struct {
+}
+
+type TaskType int
+
+const (
+	MapTask TaskType = iota
+	ReduceTask
+	CurrentNoTask
+	Done
+)
+
+func (task *Task) SetFrom(newTask *Task) {
+	task.NReduce = newTask.NReduce
+	task.TaskId = newTask.TaskId
+	task.InputMapFileName = newTask.InputMapFileName
+	task.InputMapFileIndex = newTask.InputMapFileIndex
+	task.InputReduceFileIndex = newTask.InputReduceFileIndex
+	task.InputReduceFileNames = newTask.InputReduceFileNames
+	task.TaskType = newTask.TaskType
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
