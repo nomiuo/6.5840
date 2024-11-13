@@ -1,33 +1,44 @@
 package mr
 
+import (
+	"os"
+	"strconv"
+)
+
 //
 // RPC definitions.
 //
 
 type RequestTask struct {
-	WorkerId string
 }
 
 type MapTaskDone struct {
-	WorkerId string
+	TaskId int
 
-	mapOutFiles []string
+	MapOutFiles []string
 }
 
 type ReduceTaskDone struct {
-	WorkerId string
+	TaskId int
 }
 
 type Task struct {
+	NReduce int
+
 	TaskType TaskType
 
-	MapFileIndex int
+	TaskId int
 
-	ReduceFileIndex int
+	InputMapFileIndex int
 
-	FileName string
+	InputMapFileName string
 
-	NReduce int
+	InputReduceFileIndex int
+
+	InputReduceFileNames []string
+}
+
+type Response struct {
 }
 
 type TaskType int
@@ -40,9 +51,21 @@ const (
 )
 
 func (task *Task) SetFrom(newTask *Task) {
-	task.FileName = newTask.FileName
-	task.MapFileIndex = newTask.MapFileIndex
 	task.NReduce = newTask.NReduce
-	task.ReduceFileIndex = newTask.ReduceFileIndex
+	task.TaskId = newTask.TaskId
+	task.InputMapFileName = newTask.InputMapFileName
+	task.InputMapFileIndex = newTask.InputMapFileIndex
+	task.InputReduceFileIndex = newTask.InputReduceFileIndex
+	task.InputReduceFileNames = newTask.InputReduceFileNames
 	task.TaskType = newTask.TaskType
+}
+
+// Cook up a unique-ish UNIX-domain socket name
+// in /var/tmp, for the coordinator.
+// Can't use the current directory since
+// Athena AFS doesn't support UNIX-domain sockets.
+func coordinatorSock() string {
+	s := "/var/tmp/5840-mr-"
+	s += strconv.Itoa(os.Getuid())
+	return s
 }

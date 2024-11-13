@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -26,8 +26,6 @@ type mrWorker struct {
 
 	// Reduce function provided by user.
 	reducef func(string, []string) string
-
-	workerId string
 }
 
 // for sorting by key.
@@ -41,36 +39,46 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 // Worker main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	worker := &mrWorker{mapf: mapf, reducef: reducef,
-		workerId: "mrWorker-" + strconv.Itoa(os.Getpid())}
+	log.SetOutput(io.Discard)
+	log.Printf("Start worker of %+v", os.Getpid())
 
-	task := tryContinueRequestMasterForMRTask(worker)
+	worker := &mrWorker{mapf: mapf, reducef: reducef}
 
-	switch task.TaskType {
-	case MapTask:
-		if err := worker.handleMapTask(*task); err != nil {
-			log.Fatal(err)
+	for {
+		task := tryContinueRequestMasterForMRTask(worker)
+
+		switch task.TaskType {
+		case MapTask:
+			if err := worker.handleMapTask(*task); err != nil {
+				log.Fatal(err)
+			}
+		case ReduceTask:
+			if err := worker.handleReduceTask(*task); err != nil {
+				log.Fatal(err)
+			}
+		default:
+			log.Fatal("unknown task type")
 		}
-	case ReduceTask:
-		if err := worker.handleReduceTask(*task); err != nil {
-			log.Fatal(err)
-		}
-	default:
-		log.Fatal("unknown task type")
+
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
 func (w mrWorker) handleReduceTask(task Task) error {
-	nReduceFile, err := os.Open(task.FileName)
-	if err != nil {
-		return err
+	reduceInputFiles := make([]*os.File, 0)
+	for _, reduceInputFileName := range task.InputReduceFileNames {
+		reduceInputFile, err := os.Open(reduceInputFileName)
+		if err != nil {
+			return err
+		}
+		defer tryCloseFile(reduceInputFile)
+		reduceInputFiles = append(reduceInputFiles, reduceInputFile)
 	}
-	defer tryCloseFile(nReduceFile)
 
-	intermediate := readAndSortKeyValuesFromNReduceFile(nReduceFile)
+	intermediate := readAndSortKeyValuesFromNReduceFile(reduceInputFiles)
 
 	reduceOutTempFile, err := tryCreateReduceOutTempFileInCurrentDir(
-		task.ReduceFileIndex)
+		task.NReduce)
 	if err != nil {
 		return err
 	}
@@ -80,8 +88,11 @@ func (w mrWorker) handleReduceTask(task Task) error {
 		return err
 	}
 
-	if err := os.Rename(reduceOutTempFile.Name(), reduceOutFileName(task.
-		ReduceFileIndex)); err != nil {
+	if err := os.Rename(reduceOutTempFile.Name(),
+		reduceOutFileName(task.InputReduceFileIndex)); err != nil {
+		return err
+	}
+	if err = w.tryReportReduceTaskDone(task.TaskId); err != nil {
 		return err
 	}
 
@@ -112,13 +123,21 @@ func (w mrWorker) callReduceAndWriteToTempFile(intermediate []KeyValue,
 	return nil
 }
 
-func readAndSortKeyValuesFromNReduceFile(nReduceFile *os.File) []KeyValue {
+func readAndSortKeyValuesFromNReduceFile(reduceInputFiles []*os.File) []KeyValue {
 	var intermediate []KeyValue
-	scanner := bufio.NewScanner(nReduceFile)
-	for scanner.Scan() {
-		keyValuePairs := strings.Split(" ", scanner.Text())
-		intermediate = append(intermediate,
-			KeyValue{Key: keyValuePairs[0], Value: keyValuePairs[1]})
+
+	for _, reduceInputFile := range reduceInputFiles {
+		scanner := bufio.NewScanner(reduceInputFile)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+
+			keyValuePairs := strings.SplitN(line, " ", 2)
+			intermediate = append(intermediate,
+				KeyValue{Key: keyValuePairs[0], Value: keyValuePairs[1]})
+		}
 	}
 
 	sort.Sort(ByKey(intermediate))
@@ -145,7 +164,7 @@ func (w mrWorker) handleMapTask(task Task) error {
 		return err
 	}
 
-	if err = w.tryReportMapTaskDone(mapOutFiles); err != nil {
+	if err = w.tryReportMapTaskDone(task.TaskId, mapOutFiles); err != nil {
 		return err
 	}
 
@@ -179,7 +198,7 @@ func atomicRenameTempFilesToMapOutFile(task Task,
 		if err := mapOutTempFile.Close(); err != nil {
 			return nil, err
 		}
-		outFileName := mapOutFileName(task.MapFileIndex, nReduceIndex)
+		outFileName := mapOutFileName(task.InputMapFileIndex, nReduceIndex)
 		if err := os.Rename(mapOutTempFile.Name(), outFileName); err != nil {
 			return nil, err
 		}
@@ -226,21 +245,21 @@ func tryCreateMapOutTempFileInCurrentDir(task Task, reduceIndex int) (
 	}
 
 	mapOutTempFile, err := os.CreateTemp(currentWorkDir,
-		mapOutFileName(task.MapFileIndex, reduceIndex))
+		mapOutFileName(task.InputMapFileIndex, reduceIndex))
 	if err != nil {
 		return nil, err
 	}
 	return mapOutTempFile, nil
 }
 
-func tryCreateReduceOutTempFileInCurrentDir(reduceIndex int) (*os.File, error) {
+func tryCreateReduceOutTempFileInCurrentDir(nReduce int) (*os.File, error) {
 	currentWorkDir, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
 
 	reduceOutTempFile, err := os.CreateTemp(currentWorkDir,
-		reduceOutFileName(reduceIndex))
+		reduceOutFileName(nReduce))
 	if err != nil {
 		return nil, err
 	}
@@ -257,12 +276,12 @@ func reduceOutFileName(reduceIndex int) string {
 }
 
 func (w mrWorker) callMapOnFile(task Task) ([]KeyValue, error) {
-	fileBytes, err := os.ReadFile(task.FileName)
+	fileBytes, err := os.ReadFile(task.InputMapFileName)
 	if err != nil {
 		return nil, err
 	}
 
-	return w.mapf(task.FileName, string(fileBytes)), nil
+	return w.mapf(task.InputMapFileName, string(fileBytes)), nil
 }
 
 func tryContinueRequestMasterForMRTask(worker *mrWorker) *Task {
@@ -272,6 +291,8 @@ func tryContinueRequestMasterForMRTask(worker *mrWorker) *Task {
 		time.Sleep(500 * time.Millisecond)
 		task = worker.tryRequestMasterForMRTask()
 	}
+
+	log.Printf("Worker gets task of %+v\n", task)
 	return task
 }
 
@@ -288,17 +309,17 @@ func (w mrWorker) tryRequestMasterForMRTask() *Task {
 	return task
 }
 
-func (w mrWorker) tryReportMapTaskDone(mapOutFiles []string) error {
+func (w mrWorker) tryReportMapTaskDone(taskId int, mapOutFiles []string) error {
 	if (!w.callMaster("Coordinator.ReceiveMapTaskDone",
-		&MapTaskDone{w.workerId, mapOutFiles}, nil)) {
+		&MapTaskDone{taskId, mapOutFiles}, &Response{})) {
 		return errors.New("cannot report map task done to master")
 	}
 	return nil
 }
 
-func (w mrWorker) tryReportReduceTaskDone() error {
-	if (!w.callMaster("Coordinator.ReceiveMapTaskDone",
-		&ReduceTaskDone{w.workerId}, nil)) {
+func (w mrWorker) tryReportReduceTaskDone(taskId int) error {
+	if (!w.callMaster("Coordinator.ReceiveReduceTaskDone",
+		&ReduceTaskDone{taskId}, &Response{})) {
 		return errors.New("cannot report map task done to master")
 	}
 	return nil
@@ -318,7 +339,8 @@ func (w mrWorker) requestMasterForTask() (*Task, error) {
 // usually returns true.
 // returns false if something goes wrong.
 func (w mrWorker) callMaster(rpcname string, args interface{}, reply interface{}) bool {
-	c, err := rpc.DialHTTP("tcp", "127.0.0.1:1234")
+	sockname := coordinatorSock()
+	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}

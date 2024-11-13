@@ -2,26 +2,29 @@ package mr
 
 import (
 	"container/list"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
 
 type Coordinator struct {
-	nReduce int
-
 	checkWorkDuration time.Duration
 
-	taskQueue *list.List
+	nReduce        int
+	splitFileCount int
 
-	runningTaskWorkerMap map[string]*runningTask
+	idleTaskQueue       *list.List
+	runningTaskMap      map[int]*runningTask
+	runningTaskTimerMap map[int]*time.Timer
 
-	runningTaskWorkerTimerMap map[string]*time.Timer
+	completedMapTasks []*MapTaskDone
 
-	reduceIndex int
+	currentTaskId int
 
 	mutex sync.Mutex
 }
@@ -30,8 +33,6 @@ type runningTask struct {
 	task *Task
 
 	startTime int64
-
-	workerId string
 }
 
 // start a thread that listens for RPCs from mrWorker.go
@@ -40,9 +41,12 @@ func (c *Coordinator) server() {
 	if err != nil {
 		log.Fatal("register error:", err)
 	}
-
 	rpc.HandleHTTP()
-	l, e := net.Listen("tcp", ":1234")
+
+	sockname := coordinatorSock()
+	os.Remove(sockname)
+	l, e := net.Listen("unix", sockname)
+
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
@@ -60,47 +64,65 @@ func (c *Coordinator) Done() bool {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	return c.taskQueue.Len() == 0 && len(c.runningTaskWorkerMap) == 0
+	return c.done()
 }
 
-func (c *Coordinator) ReceiveMapTaskDone(taskDone *MapTaskDone) {
+func (c *Coordinator) done() bool {
+	return c.idleTaskQueue.Len() == 0 && len(c.runningTaskMap) == 0
+}
+
+func (c *Coordinator) ReceiveMapTaskDone(taskDone *MapTaskDone, response *Response) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.runningTaskWorkerMap[taskDone.WorkerId] != nil {
-		log.Println("The task has been done.")
-		return
+	if c.runningTaskMap[taskDone.TaskId] == nil {
+		log.Printf("Task of %d has been done, don't need to clear meta data.", taskDone.TaskId)
+		return nil
 	}
 
-	c.clearTask(taskDone.WorkerId)
-	c.addReduceTaskFromMapTask(*taskDone)
+	log.Printf("Map Task of %d is done.\n", taskDone.TaskId)
+
+	c.clearTask(taskDone.TaskId)
+	c.addCompletedMapTask(*taskDone)
+	c.tryAddReduceTasks()
+
+	return nil
 }
 
-func (c *Coordinator) ReceiveReduceTaskDone(taskDone *ReduceTaskDone) {
+func (c *Coordinator) ReceiveReduceTaskDone(taskDone *ReduceTaskDone, response *Response) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.runningTaskWorkerMap[taskDone.WorkerId] != nil {
-		log.Println("The task has been done.")
-		return
+	if c.runningTaskMap[taskDone.TaskId] == nil {
+		log.Printf("Task of %d has been done, don't need to clear meta data.", taskDone.TaskId)
+		return nil
 	}
 
-	c.clearTask(taskDone.WorkerId)
+	log.Printf("Reduce task of %d is done.\n", taskDone.TaskId)
+
+	c.clearTask(taskDone.TaskId)
+	return nil
 }
 
-func (c *Coordinator) clearTask(workerId string) {
-	delete(c.runningTaskWorkerMap, workerId)
+func (c *Coordinator) clearTask(taskId int) {
+	delete(c.runningTaskMap, taskId)
 
-	timer := c.runningTaskWorkerTimerMap[workerId]
+	timer := c.runningTaskTimerMap[taskId]
 	timer.Stop()
-	delete(c.runningTaskWorkerTimerMap, workerId)
+	delete(c.runningTaskTimerMap, taskId)
 }
 
 func (c *Coordinator) PollTask(requestTask *RequestTask, task *Task) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	if c.taskQueue.Len() == 0 {
+	if c.done() {
+		task.TaskType = Done
+		log.Printf("All tasks has been done.\n")
+		return nil
+	}
+
+	if c.idleTaskQueue.Len() == 0 {
 		task.TaskType = CurrentNoTask
 		return nil
 	}
@@ -108,77 +130,111 @@ func (c *Coordinator) PollTask(requestTask *RequestTask, task *Task) error {
 	newTask := c.popFrontTask()
 	task.SetFrom(newTask)
 
-	c.addRunningTask(*requestTask, newTask)
-	c.registerCheckTimer(*requestTask)
+	c.addRunningTask(newTask)
+	c.registerCheckTimer(newTask.TaskId)
+
+	log.Printf("Master offer task of %+v", task)
 
 	return nil
 }
 
-func (c *Coordinator) registerCheckTimer(requestTask RequestTask) {
+func (c *Coordinator) registerCheckTimer(taskId int) {
 	timer := time.AfterFunc(c.checkWorkDuration, func() {
 		c.mutex.Lock()
 		defer c.mutex.Unlock()
-		runningTask := c.runningTaskWorkerMap[requestTask.WorkerId]
+		runningTask := c.runningTaskMap[taskId]
 
 		if runningTask != nil {
-			delete(c.runningTaskWorkerMap, requestTask.WorkerId)
-			delete(c.runningTaskWorkerTimerMap, requestTask.WorkerId)
-			c.taskQueue.PushBack(runningTask.task)
+			log.Printf("%+v Task of %d is expired, push back to idle task queue\n",
+				runningTask.task.TaskType, taskId)
+			delete(c.runningTaskMap, taskId)
+			delete(c.runningTaskTimerMap, taskId)
+			c.idleTaskQueue.PushBack(runningTask.task)
 		}
 	})
-	c.runningTaskWorkerTimerMap[requestTask.WorkerId] = timer
+	c.runningTaskTimerMap[taskId] = timer
 }
 
-func (c *Coordinator) addReduceTaskFromMapTask(mapTaskDone MapTaskDone) {
-	for i := 0; i < len(mapTaskDone.mapOutFiles); i++ {
-		reduceTask := Task{
-			FileName:        mapTaskDone.mapOutFiles[i],
-			NReduce:         c.nReduce,
-			ReduceFileIndex: c.reduceIndex,
-			TaskType:        ReduceTask,
-		}
-		c.taskQueue.PushBack(&reduceTask)
-		c.reduceIndex++
+func (c *Coordinator) addCompletedMapTask(mapTaskDone MapTaskDone) {
+	c.completedMapTasks = append(c.completedMapTasks, &mapTaskDone)
+}
+
+func (c *Coordinator) tryAddReduceTasks() {
+	if len(c.completedMapTasks) != c.splitFileCount &&
+		len(c.completedMapTasks) > 0 {
+		return
 	}
+
+	reduceTasks := make([]*Task, c.nReduce)
+	for i := 0; i < c.nReduce; i++ {
+		reduceTasks[i] = &Task{
+			NReduce:              c.nReduce,
+			TaskType:             ReduceTask,
+			TaskId:               c.nextTaskId(),
+			InputReduceFileIndex: i,
+			InputReduceFileNames: make([]string, 0),
+		}
+	}
+
+	for _, completedMapTask := range c.completedMapTasks {
+		for rFileIndx, rFileName := range completedMapTask.MapOutFiles {
+			reduceTasks[rFileIndx].InputReduceFileNames = append(
+				reduceTasks[rFileIndx].InputReduceFileNames, rFileName)
+		}
+	}
+
+	for _, reduceTask := range reduceTasks {
+		c.idleTaskQueue.PushBack(reduceTask)
+	}
+
+	clear(c.completedMapTasks)
 }
 
-func (c *Coordinator) addRunningTask(requestTask RequestTask, task *Task) {
-	c.runningTaskWorkerMap[requestTask.WorkerId] = &runningTask{
+func (c *Coordinator) addRunningTask(task *Task) {
+	c.runningTaskMap[task.TaskId] = &runningTask{
 		task:      task,
 		startTime: time.Now().UnixMilli(),
-		workerId:  requestTask.WorkerId,
 	}
 }
 
 func (c *Coordinator) popFrontTask() *Task {
-	front := c.taskQueue.Front()
-	c.taskQueue.Remove(front)
+	front := c.idleTaskQueue.Front()
+	c.idleTaskQueue.Remove(front)
 	return front.Value.(*Task)
 }
 
 func (c *Coordinator) initMapTask(originalFileNames []string) {
+	log.Printf("Init all map tasks for: %+v", originalFileNames)
+
 	for index, originalFileName := range originalFileNames {
-		c.taskQueue.PushBack(&Task{
-			TaskType:     MapTask,
-			MapFileIndex: index,
-			FileName:     originalFileName,
-			NReduce:      c.nReduce,
+		c.idleTaskQueue.PushBack(&Task{
+			TaskType:          MapTask,
+			TaskId:            c.nextTaskId(),
+			InputMapFileIndex: index,
+			InputMapFileName:  originalFileName,
+			NReduce:           c.nReduce,
 		})
 	}
+}
+
+func (c *Coordinator) nextTaskId() int {
+	c.currentTaskId += 1
+	return c.currentTaskId
 }
 
 // MakeCoordinator create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	log.SetOutput(io.Discard)
 	c := Coordinator{
-		nReduce:                   nReduce,
-		checkWorkDuration:         10 * time.Second,
-		taskQueue:                 list.New(),
-		runningTaskWorkerMap:      make(map[string]*runningTask),
-		runningTaskWorkerTimerMap: make(map[string]*time.Timer),
-		reduceIndex:               0,
-		mutex:                     sync.Mutex{},
+		splitFileCount:      len(files),
+		nReduce:             nReduce,
+		checkWorkDuration:   10 * time.Second,
+		idleTaskQueue:       list.New(),
+		runningTaskMap:      make(map[int]*runningTask),
+		runningTaskTimerMap: make(map[int]*time.Timer),
+		mutex:               sync.Mutex{},
 	}
 	c.initMapTask(files)
 

@@ -4,4 +4,4 @@ api.key
 *-handin.tar.gz
 .idea/
 .vscode/
-**/map-split-*
+**/mr-*
