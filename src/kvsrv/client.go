@@ -1,13 +1,24 @@
 package kvsrv
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"fmt"
+	"math/big"
+	"os"
+	"sync"
+	"time"
 
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
 	server *labrpc.ClientEnd
-	// You will have to modify this struct.
+
+	clientName string
+
+	opIndex uint
+
+	mu sync.Mutex
 }
 
 func nrand() int64 {
@@ -18,10 +29,14 @@ func nrand() int64 {
 }
 
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.server = server
-	// You'll have to add code here.
-	return ck
+	clientName := newClientName()
+
+	return &Clerk{
+		server:     server,
+		clientName: clientName,
+		opIndex:    0,
+		mu:         sync.Mutex{},
+	}
 }
 
 // fetch the current value for a key.
@@ -35,9 +50,12 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
+	req := GetArgs{key}
+	reply := GetReply{}
 
-	// You will have to modify this function.
-	return ""
+	ck.callSrv("KVServer.Get", &req, &reply)
+
+	return reply.Value
 }
 
 // shared by Put and Append.
@@ -49,8 +67,15 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
-	// You will have to modify this function.
-	return ""
+	nextOpIndex := ck.nextOpIndex()
+
+	req := PutAppendArgs{ClientMeta: ClientMeta{ck.clientName, nextOpIndex},
+		Key: key, Value: value}
+	reply := PutAppendReply{}
+
+	ck.callSrv(fmt.Sprintf("KVServer.%s", op), &req, &reply)
+
+	return reply.Value
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -60,4 +85,27 @@ func (ck *Clerk) Put(key string, value string) {
 // Append value to key's value and return that value
 func (ck *Clerk) Append(key string, value string) string {
 	return ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) callSrv(rpcName string,
+	args interface{}, reply interface{}) {
+	for {
+		if ok := ck.server.Call(rpcName, args, reply); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) nextOpIndex() uint {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+
+	ck.opIndex++
+
+	return ck.opIndex
+}
+
+func newClientName() string {
+	return fmt.Sprintf("%d-%x", os.Getpid(), nrand())
 }
